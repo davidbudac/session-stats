@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""Token / cache / subagent statistics for a Claude Code session.
+"""Token / cache / subagent statistics for Claude Code sessions.
 
-Reads the session transcript(s) under ~/.claude/projects/ and reports
-input, output and cache token usage for the main thread plus every
-subagent (recursively), including the model each one actually ran on.
+Reads the session transcript(s) under ~/.claude/projects/ and reports input,
+output and cache token usage for the main thread plus every subagent
+(recursively), including the model each one actually ran on.
 
-Usage:
-    session_stats.py [--session <id>] [--json] [--project-dir <dir>]
+Modes:
+    session_stats.py                     report on the current session
+    session_stats.py --session <id>       report on another session
+    session_stats.py --json              machine-readable report
+    session_stats.py --log               append one record to the history log
+                                         (SessionEnd hook entry point)
+    session_stats.py --rollup            aggregate the history log
+    session_stats.py --backfill          log every past session not yet logged
 
-With no --session it uses $CLAUDE_CODE_SESSION_ID, falling back to the
-most recently modified transcript for the current working directory.
+With no --session it uses $CLAUDE_CODE_SESSION_ID, falling back to the most
+recently modified transcript for the current working directory.
+
+History log (JSONL, one record per session):
+    ~/.claude/session-stats/sessions.jsonl   ($CLAUDE_SESSION_STATS_LOG overrides)
 """
 
 import argparse
@@ -18,32 +27,40 @@ import json
 import os
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
+DEFAULT_LOG = os.path.expanduser("~/.claude/session-stats/sessions.jsonl")
+SCHEMA_VERSION = 1
 
 USAGE_FIELDS = ("input_tokens", "output_tokens",
                 "cache_creation_input_tokens", "cache_read_input_tokens")
+SUM_FIELDS = USAGE_FIELDS + ("requests", "ephemeral_1h", "ephemeral_5m",
+                             "web_search", "web_fetch", "api_errors")
+
+
+def log_path():
+    return os.environ.get("CLAUDE_SESSION_STATS_LOG") or DEFAULT_LOG
 
 
 # ---------------------------------------------------------------- parsing
 
 
-def read_jsonl(path):
-    rows = []
+def iter_rows(path):
+    """Stream transcript rows; tolerate a half-written trailing line."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue  # last line may be half-written
+        fh = open(path, "r", encoding="utf-8", errors="replace")
     except OSError:
-        pass
-    return rows
+        return
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
 
 def blank():
@@ -66,13 +83,30 @@ def blank():
     }
 
 
-def summarize(rows):
-    """Aggregate one transcript. Usage is repeated on every content block of a
-    message, so requests are deduped on (requestId, message.id)."""
+def scan(path, skip_sidechain=False):
+    """Aggregate one transcript in a single streaming pass.
+
+    Returns (stats, tool_use_ids, meta). Usage is repeated on every content
+    block of a message, so requests are deduped on (requestId, message.id) --
+    without that, totals come out 2-4x too high.
+    """
     s = blank()
+    tool_ids = set()
+    meta = {}
     seen = set()
 
-    for row in rows:
+    for row in iter_rows(path):
+        if skip_sidechain and row.get("isSidechain"):
+            continue
+        if "cwd" in row and "cwd" not in meta:
+            meta["cwd"] = row["cwd"]
+        if "version" in row:
+            meta["version"] = row["version"]
+        if "sessionId" in row and "sessionId" not in meta:
+            meta["sessionId"] = row["sessionId"]
+        if "gitBranch" in row and row.get("gitBranch"):
+            meta["gitBranch"] = row["gitBranch"]
+
         ts = row.get("timestamp")
         if ts:
             if s["first_ts"] is None or ts < s["first_ts"]:
@@ -95,6 +129,7 @@ def summarize(rows):
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     s["tools"][b.get("name", "?")] += 1
+                    tool_ids.add(b.get("id"))
 
         if row.get("type") != "assistant":
             continue
@@ -124,17 +159,20 @@ def summarize(rows):
         s["web_search"] += stu.get("web_search_requests") or 0
         s["web_fetch"] += stu.get("web_fetch_requests") or 0
 
-    return s
+    return s, tool_ids, meta
 
 
 def add_into(total, s):
-    for f in USAGE_FIELDS + ("requests", "ephemeral_1h", "ephemeral_5m",
-                             "web_search", "web_fetch", "api_errors"):
+    for f in SUM_FIELDS:
         total[f] += s[f]
     total["tools"].update(s["tools"])
     for model, m in s["by_model"].items():
         for k, v in m.items():
             total["by_model"][model][k] += v
+    for f in ("first_ts", "last_ts"):
+        if s[f] and (total[f] is None or
+                     (s[f] < total[f] if f == "first_ts" else s[f] > total[f])):
+            total[f] = s[f]
     return total
 
 
@@ -176,38 +214,32 @@ def collect_agents(project_dir, session_id):
         meta_path = path[:-len(".jsonl")] + ".meta.json"
         if os.path.exists(meta_path):
             try:
-                meta = json.load(open(meta_path))
+                with open(meta_path) as fh:
+                    meta = json.load(fh)
             except (OSError, json.JSONDecodeError):
                 meta = {}
         agents.append({"id": agent_id, "path": path, "meta": meta})
 
     # legacy layout: <project>/agent-<id>.jsonl carrying sessionId inside
     for path in sorted(glob.glob(os.path.join(project_dir, "agent-*.jsonl"))):
-        rows = read_jsonl(path)
-        if not rows or rows[0].get("sessionId") != session_id:
+        first = next(iter_rows(path), None)
+        if not first or first.get("sessionId") != session_id:
             continue
         agent_id = os.path.basename(path)[len("agent-"):-len(".jsonl")]
         agents.append({"id": agent_id, "path": path, "meta": {}})
 
     for a in agents:
-        a["rows"] = read_jsonl(a["path"])
-        a["stats"] = summarize(a["rows"])
+        a["stats"], a["tool_ids"], _ = scan(a["path"])
     return agents
 
 
-def link_parents(agents, main_rows):
-    """Attach parent_id using meta.parentAgentId, or by finding which
+def link_parents(agents, main_tool_ids):
+    """Attach parent_id from meta.parentAgentId, else by finding which
     transcript issued the spawning tool_use id."""
-    owner = {}  # tool_use id -> agent id that issued it ('' = main thread)
-    for row in main_rows:
-        for b in (row.get("message") or {}).get("content") or []:
-            if isinstance(b, dict) and b.get("type") == "tool_use":
-                owner[b.get("id")] = ""
+    owner = {tid: "" for tid in main_tool_ids}
     for a in agents:
-        for row in a["rows"]:
-            for b in (row.get("message") or {}).get("content") or []:
-                if isinstance(b, dict) and b.get("type") == "tool_use":
-                    owner[b.get("id")] = a["id"]
+        for tid in a["tool_ids"]:
+            owner[tid] = a["id"]
 
     known = {a["id"] for a in agents}
     for a in agents:
@@ -225,7 +257,8 @@ def read_workflows(project_dir, session_id):
     for path in sorted(glob.glob(os.path.join(
             project_dir, session_id, "workflows", "wf_*.json"))):
         try:
-            d = json.load(open(path))
+            with open(path) as fh:
+                d = json.load(fh)
         except (OSError, json.JSONDecodeError):
             continue
         out.append({
@@ -239,6 +272,30 @@ def read_workflows(project_dir, session_id):
     return out
 
 
+def build_report(path, session_id, fallback_cwd):
+    project_dir = os.path.dirname(path)
+    main_stats, main_tool_ids, meta = scan(path, skip_sidechain=True)
+    agents = link_parents(collect_agents(project_dir, session_id), main_tool_ids)
+
+    agent_total = blank()
+    for a in agents:
+        add_into(agent_total, a["stats"])
+    grand = add_into(add_into(blank(), main_stats), agent_total)
+
+    return {
+        "session_id": session_id,
+        "transcript": path,
+        "cwd": meta.get("cwd") or fallback_cwd,
+        "version": meta.get("version"),
+        "git_branch": meta.get("gitBranch"),
+        "main": main_stats,
+        "agents": agents,
+        "agent_total": agent_total,
+        "grand_total": grand,
+        "workflows": read_workflows(project_dir, session_id),
+    }
+
+
 # ------------------------------------------------------------- rendering
 
 
@@ -246,28 +303,35 @@ def n(v):
     return "{:,}".format(int(v or 0))
 
 
-def dur(first, last):
-    if not first or not last:
-        return "-"
+def parse_ts(ts):
+    if not ts:
+        return None
     try:
-        a = datetime.fromisoformat(first.replace("Z", "+00:00"))
-        b = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except ValueError:
+        return None
+
+
+def secs_between(first, last):
+    a, b = parse_ts(first), parse_ts(last)
+    return int((b - a).total_seconds()) if a and b else None
+
+
+def fmt_secs(secs):
+    if secs is None:
         return "-"
-    secs = int((b - a).total_seconds())
-    h, rem = divmod(secs, 3600)
+    h, rem = divmod(int(secs), 3600)
     m, s = divmod(rem, 60)
     return ("%dh%02dm" % (h, m)) if h else ("%dm%02ds" % (m, s)) if m else ("%ds" % s)
 
 
+def dur(first, last):
+    return fmt_secs(secs_between(first, last))
+
+
 def local(ts):
-    if not ts:
-        return "-"
-    try:
-        d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return ts
-    return d.astimezone().strftime("%Y-%m-%d %H:%M")
+    d = parse_ts(ts)
+    return d.astimezone().strftime("%Y-%m-%d %H:%M") if d else (ts or "-")
 
 
 def token_block(s, indent=""):
@@ -293,15 +357,15 @@ def token_block(s, indent=""):
     return lines
 
 
-def model_table(s, indent=""):
-    rows = sorted(s["by_model"].items(), key=lambda kv: -kv[1]["output_tokens"])
+def model_table(by_model, indent=""):
+    rows = sorted(by_model.items(), key=lambda kv: -kv[1]["output_tokens"])
     out = ["%s%-26s %5s %11s %11s %11s %11s" % (
         indent, "model", "reqs", "input", "cache wr", "cache rd", "output")]
     for model, m in rows:
         out.append("%s%-26s %5s %11s %11s %11s %11s" % (
-            indent, model[:26], n(m["requests"]), n(m["input_tokens"]),
-            n(m["cache_creation_input_tokens"]), n(m["cache_read_input_tokens"]),
-            n(m["output_tokens"])))
+            indent, model[:26], n(m.get("requests")), n(m.get("input_tokens")),
+            n(m.get("cache_creation_input_tokens")),
+            n(m.get("cache_read_input_tokens")), n(m.get("output_tokens"))))
     return out
 
 
@@ -310,9 +374,7 @@ def agent_label(a):
     bits = [meta.get("agentType") or "agent"]
     if meta.get("name"):
         bits.append("(%s)" % meta["name"])
-    label = " ".join(bits)
-    desc = meta.get("description")
-    return label, desc
+    return " ".join(bits), meta.get("description")
 
 
 def render(report):
@@ -332,7 +394,7 @@ def render(report):
     L.append("-- MAIN THREAD " + "-" * (W - 15))
     L += token_block(report["main"])
     L.append("")
-    L += model_table(report["main"], "  ")
+    L += model_table(report["main"]["by_model"], "  ")
 
     tools = report["main"]["tools"]
     if tools:
@@ -373,29 +435,29 @@ def render(report):
                 walk(a["id"], depth + 1)
 
         walk("", 0)
-        orphan_parents = set(by_parent) - {a["id"] for a in agents} - {""}
-        for p in sorted(orphan_parents):
+        orphans = set(by_parent) - {a["id"] for a in agents} - {""}
+        for p in sorted(orphans):
             walk(p, 0)
 
         L.append("")
         L.append("  subagent totals:")
         L += token_block(report["agent_total"], "    ")
         L.append("")
-        L += model_table(report["agent_total"], "    ")
+        L += model_table(report["agent_total"]["by_model"], "    ")
 
     if report["workflows"]:
         L.append("")
         L.append("-- WORKFLOWS " + "-" * (W - 13))
         for w in report["workflows"]:
             L.append("  %-28s %-10s agents=%s model=%s" % (
-                (w["name"] or w["runId"])[:28], w["status"] or "?",
+                (w["name"] or w["runId"] or "?")[:28], w["status"] or "?",
                 w["agentCount"], w["defaultModel"]))
 
     L.append("")
     L.append("-- GRAND TOTAL (main + subagents) " + "-" * (W - 34))
     L += token_block(report["grand_total"])
     L.append("")
-    L += model_table(report["grand_total"], "  ")
+    L += model_table(report["grand_total"]["by_model"], "  ")
     L.append("=" * W)
     return "\n".join(L)
 
@@ -411,62 +473,346 @@ def jsonable(s):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--session", help="session id (default: current session)")
-    ap.add_argument("--project-dir", help="cwd to resolve the session from")
-    ap.add_argument("--json", action="store_true", help="emit JSON")
-    args = ap.parse_args()
-
-    cwd = args.project_dir or os.getcwd()
-    path, session_id = find_session(args.session, cwd)
-    project_dir = os.path.dirname(path)
-
-    main_rows = [r for r in read_jsonl(path) if not r.get("isSidechain")]
-    main_stats = summarize(main_rows)
-
-    agents = link_parents(collect_agents(project_dir, session_id), main_rows)
-
-    agent_total = blank()
-    for a in agents:
-        add_into(agent_total, a["stats"])
-    grand = add_into(add_into(blank(), main_stats), agent_total)
-
-    report = {
-        "session_id": session_id,
-        "transcript": path,
-        "cwd": next((r["cwd"] for r in main_rows if r.get("cwd")), cwd),
-        "main": main_stats,
-        "agents": agents,
-        "agent_total": agent_total,
-        "grand_total": grand,
-        "workflows": read_workflows(project_dir, session_id),
+def report_json(report):
+    return {
+        "session_id": report["session_id"],
+        "transcript": report["transcript"],
+        "cwd": report["cwd"],
+        "version": report["version"],
+        "git_branch": report["git_branch"],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "main": jsonable(report["main"]),
+        "agents": [{
+            "id": a["id"],
+            "parent_id": a["parent_id"] or None,
+            "agent_type": a["meta"].get("agentType"),
+            "name": a["meta"].get("name"),
+            "description": a["meta"].get("description"),
+            "requested_model": a["meta"].get("model"),
+            "spawn_depth": a["meta"].get("spawnDepth"),
+            "stats": jsonable(a["stats"]),
+        } for a in report["agents"]],
+        "agent_total": jsonable(report["agent_total"]),
+        "grand_total": jsonable(report["grand_total"]),
+        "workflows": report["workflows"],
     }
+
+
+# ------------------------------------------------------------ history log
+
+
+def log_record(report, reason=None):
+    """Compact one-line-per-session record for the history log."""
+    g, m = report["grand_total"], report["main"]
+    return {
+        "schema": SCHEMA_VERSION,
+        "session_id": report["session_id"],
+        "logged_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "cwd": report["cwd"],
+        "git_branch": report["git_branch"],
+        "cc_version": report["version"],
+        "started_at": m["first_ts"],
+        "ended_at": g["last_ts"],
+        "duration_s": secs_between(g["first_ts"], g["last_ts"]),
+        "user_prompts": m["user_turns"],
+        "agent_count": len(report["agents"]),
+        "workflow_count": len(report["workflows"]),
+        "main": jsonable(m),
+        "agent_total": jsonable(report["agent_total"]),
+        "grand_total": jsonable(g),
+        "agents": [{
+            "id": a["id"],
+            "parent_id": a["parent_id"] or None,
+            "agent_type": a["meta"].get("agentType"),
+            "name": a["meta"].get("name"),
+            "models": sorted(a["stats"]["by_model"]),
+            "requests": a["stats"]["requests"],
+            "input_tokens": a["stats"]["input_tokens"],
+            "output_tokens": a["stats"]["output_tokens"],
+            "cache_creation_input_tokens": a["stats"]["cache_creation_input_tokens"],
+            "cache_read_input_tokens": a["stats"]["cache_read_input_tokens"],
+        } for a in report["agents"]],
+    }
+
+
+def append_record(record, path=None):
+    path = path or log_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return path
+
+
+def read_log(path=None):
+    """Records from the log, deduped per session id (largest total wins).
+
+    A session can be logged more than once -- /clear fires SessionEnd while the
+    id lives on, and a backfill may re-log a session -- so keep the record with
+    the most output tokens, which is the most complete one.
+    """
+    path = path or log_path()
+    best = {}
+    for rec in iter_rows(path):
+        sid = rec.get("session_id")
+        if not sid:
+            continue
+        prev = best.get(sid)
+        if prev is None or (rec.get("grand_total", {}).get("output_tokens", 0) >
+                            prev.get("grand_total", {}).get("output_tokens", 0)):
+            best[sid] = rec
+    return sorted(best.values(), key=lambda r: r.get("ended_at") or "")
+
+
+def logged_session_ids(path=None):
+    return {rec.get("session_id") for rec in iter_rows(path or log_path())}
+
+
+def hook_payload():
+    """SessionEnd hooks receive JSON on stdin; tolerate its absence."""
+    if sys.stdin is None or sys.stdin.isatty():
+        return {}
+    try:
+        raw = sys.stdin.read()
+    except OSError:
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def do_log(args):
+    payload = hook_payload()
+    session_id = args.session or payload.get("session_id")
+    transcript = payload.get("transcript_path")
+    cwd = args.project_dir or payload.get("cwd") or os.getcwd()
+
+    if transcript and os.path.exists(transcript):
+        path = transcript
+        session_id = session_id or os.path.basename(path)[:-6]
+    else:
+        path, session_id = find_session(session_id, cwd)
+
+    report = build_report(path, session_id, cwd)
+    if not report["grand_total"]["requests"]:
+        return 0  # nothing happened; don't clutter the log
+
+    rec = log_record(report, reason=payload.get("reason") or args.reason)
+    dest = append_record(rec, args.log_file)
+    if args.verbose:
+        g = rec["grand_total"]
+        print("session-stats: logged %s to %s (%s in / %s out)" % (
+            session_id, dest, n(g["total_input_tokens"]), n(g["output_tokens"])))
+    return 0
+
+
+def do_backfill(args):
+    known = logged_session_ids(args.log_file)
+    candidates = []
+    for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        name = os.path.basename(path)
+        if name.startswith("agent-"):
+            continue
+        sid = name[:-len(".jsonl")]
+        if sid in known:
+            continue
+        candidates.append((path, sid))
+
+    added = skipped = 0
+    for path, sid in sorted(candidates, key=lambda c: os.path.getmtime(c[0])):
+        try:
+            report = build_report(path, sid, os.path.dirname(path))
+        except Exception as exc:  # a corrupt transcript must not abort the sweep
+            print("session-stats: skipped %s (%s)" % (sid, exc), file=sys.stderr)
+            skipped += 1
+            continue
+        if not report["grand_total"]["requests"]:
+            skipped += 1
+            continue
+        append_record(log_record(report, reason="backfill"), args.log_file)
+        added += 1
+    print("session-stats: backfilled %d session(s), skipped %d, log: %s"
+          % (added, skipped, args.log_file or log_path()))
+    return 0
+
+
+def bucket_totals(records, keyfn):
+    out = defaultdict(lambda: {"sessions": 0, "requests": 0, "input_tokens": 0,
+                               "output_tokens": 0,
+                               "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "agents": 0})
+    for rec in records:
+        key = keyfn(rec)
+        if key is None:
+            continue
+        b = out[key]
+        b["sessions"] += 1
+        b["agents"] += rec.get("agent_count") or 0
+        g = rec.get("grand_total") or {}
+        for f in ("requests",) + USAGE_FIELDS:
+            b[f] += g.get(f) or 0
+    return out
+
+
+def rollup_row(label, b, width=24):
+    total_in = (b["input_tokens"] + b["cache_creation_input_tokens"]
+                + b["cache_read_input_tokens"])
+    return "  %-*s %6s %5s %10s %10s %12s %11s" % (
+        width, label[:width], n(b["sessions"]), n(b["agents"]),
+        n(b["input_tokens"]), n(b["cache_creation_input_tokens"]),
+        n(total_in), n(b["output_tokens"]))
+
+
+def rollup_header(what, width=24):
+    return "  %-*s %6s %5s %10s %10s %12s %11s" % (
+        width, what, "sess", "agts", "input", "cache wr", "total in", "output")
+
+
+def do_rollup(args):
+    path = args.log_file or log_path()
+    records = read_log(path)
+    if args.days:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+        records = [r for r in records
+                   if (parse_ts(r.get("ended_at")) or parse_ts(r.get("logged_at"))
+                       or datetime.now(timezone.utc)) >= cutoff]
 
     if args.json:
         print(json.dumps({
-            "session_id": session_id,
-            "transcript": path,
-            "cwd": report["cwd"],
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "main": jsonable(main_stats),
-            "agents": [{
-                "id": a["id"],
-                "parent_id": a["parent_id"] or None,
-                "agent_type": a["meta"].get("agentType"),
-                "name": a["meta"].get("name"),
-                "description": a["meta"].get("description"),
-                "requested_model": a["meta"].get("model"),
-                "spawn_depth": a["meta"].get("spawnDepth"),
-                "stats": jsonable(a["stats"]),
-            } for a in agents],
-            "agent_total": jsonable(agent_total),
-            "grand_total": jsonable(grand),
-            "workflows": report["workflows"],
-        }, indent=2))
-    else:
-        print(render(report))
+            "log": path,
+            "days": args.days,
+            "sessions": len(records),
+            "totals": dict(bucket_totals(records, lambda r: "all")["all"]),
+            "by_day": {k: dict(v) for k, v in
+                       bucket_totals(records, lambda r: (r.get("ended_at") or "")[:10]).items()},
+            "by_project": {k: dict(v) for k, v in
+                           bucket_totals(records, lambda r: r.get("cwd") or "?").items()},
+            "records": records if args.full else None,
+        }, indent=2, default=str))
+        return 0
+
+    W = 88
+    L = ["=" * W, "Claude Code usage history", "=" * W,
+         "%-16s %s" % ("Log", path),
+         "%-16s %s" % ("Sessions", "%d%s" % (
+             len(records), " (last %d days)" % args.days if args.days else ""))]
+    if not records:
+        L.append("")
+        L.append("  Log is empty. Install the SessionEnd hook, or run --backfill")
+        L.append("  to import sessions from the transcripts still on disk.")
+        print("\n".join(L))
+        return 0
+
+    span = "%s -> %s" % (local(records[0].get("ended_at")),
+                         local(records[-1].get("ended_at")))
+    L.append("%-16s %s" % ("Span", span))
+
+    tot = bucket_totals(records, lambda r: "all")["all"]
+    total_in = (tot["input_tokens"] + tot["cache_creation_input_tokens"]
+                + tot["cache_read_input_tokens"])
+    hit = 100.0 * tot["cache_read_input_tokens"] / total_in if total_in else 0.0
+    secs = sum(r.get("duration_s") or 0 for r in records)
+    L += ["",
+          "-- TOTALS " + "-" * (W - 10),
+          "%-22s %14s" % ("API requests", n(tot["requests"])),
+          "%-22s %14s" % ("Input (uncached)", n(tot["input_tokens"])),
+          "%-22s %14s" % ("Cache write", n(tot["cache_creation_input_tokens"])),
+          "%-22s %14s" % ("Cache read", n(tot["cache_read_input_tokens"])),
+          "%-22s %14s" % ("Output", n(tot["output_tokens"])),
+          "%-22s %14s" % ("Total input", n(total_in)),
+          "%-22s %13.1f%%" % ("Cache hit rate", hit),
+          "%-22s %14s" % ("Subagents spawned", n(tot["agents"])),
+          "%-22s %14s" % ("Elapsed (incl. idle)", fmt_secs(secs))]
+
+    by_model = defaultdict(lambda: defaultdict(int))
+    for rec in records:
+        for model, m in (rec.get("grand_total", {}).get("by_model") or {}).items():
+            for k, v in m.items():
+                by_model[model][k] += v
+    L.append("")
+    L += model_table(by_model, "  ")
+
+    days = bucket_totals(records, lambda r: (r.get("ended_at") or "")[:10])
+    L += ["", "-- BY DAY " + "-" * (W - 10), rollup_header("day", 12)]
+    for day in sorted(days, reverse=True)[:args.top]:
+        L.append(rollup_row(day or "?", days[day], 12))
+
+    projects = bucket_totals(records, lambda r: r.get("cwd") or "?")
+    L += ["", "-- BY PROJECT " + "-" * (W - 14), rollup_header("project", 40)]
+    for cwd in sorted(projects, key=lambda k: -projects[k]["output_tokens"])[:args.top]:
+        L.append(rollup_row(os.path.basename(cwd.rstrip("/")) or cwd,
+                            projects[cwd], 40))
+
+    L += ["", "-- BIGGEST SESSIONS " + "-" * (W - 20),
+          "  %-38s %10s %11s %11s %6s" % ("session", "output", "total in",
+                                          "requests", "agents")]
+    for rec in sorted(records, key=lambda r: -(r.get("grand_total", {})
+                                               .get("output_tokens") or 0))[:args.top]:
+        g = rec.get("grand_total") or {}
+        label = "%s %s" % ((rec.get("ended_at") or "")[:10],
+                           os.path.basename((rec.get("cwd") or "?").rstrip("/")))
+        L.append("  %-38s %10s %11s %11s %6s" % (
+            label[:38], n(g.get("output_tokens")),
+            n(g.get("total_input_tokens")), n(g.get("requests")),
+            n(rec.get("agent_count"))))
+
+    L.append("=" * W)
+    print("\n".join(L))
+    return 0
+
+
+# ------------------------------------------------------------------ main
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--session", help="session id (default: current session)")
+    ap.add_argument("--project-dir", help="cwd to resolve the session from")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--log", action="store_true",
+                    help="append this session to the history log (SessionEnd hook)")
+    ap.add_argument("--rollup", action="store_true",
+                    help="aggregate the history log across sessions")
+    ap.add_argument("--backfill", action="store_true",
+                    help="log every past session not already in the log")
+    ap.add_argument("--log-file", help="history log path (default %s)" % DEFAULT_LOG)
+    ap.add_argument("--days", type=int, default=0,
+                    help="--rollup: only sessions from the last N days (0 = all)")
+    ap.add_argument("--top", type=int, default=10,
+                    help="--rollup: rows per table (default 10)")
+    ap.add_argument("--full", action="store_true",
+                    help="--rollup --json: include every session record")
+    ap.add_argument("--reason", help="--log: reason to record (hook supplies one)")
+    ap.add_argument("--verbose", action="store_true", help="--log: report what was written")
+    args = ap.parse_args()
+
+    if args.rollup:
+        return do_rollup(args)
+    if args.backfill:
+        return do_backfill(args)
+    if args.log:
+        try:
+            return do_log(args)
+        except SystemExit:
+            raise
+        except Exception as exc:  # never break the session on the way out
+            print("session-stats: %s" % exc, file=sys.stderr)
+            return 0
+
+    cwd = args.project_dir or os.getcwd()
+    path, session_id = find_session(args.session, cwd)
+    report = build_report(path, session_id, cwd)
+    print(json.dumps(report_json(report), indent=2) if args.json else render(report))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

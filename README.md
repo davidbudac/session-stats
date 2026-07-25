@@ -43,6 +43,42 @@ Cache hit rate                  95.3%
 Plus a workflow-run summary when the session ran `Workflow`, and a grand total
 across main thread and every subagent.
 
+## Long-term history
+
+Transcripts get cleaned up (`cleanupPeriodDays`, 30 by default), so the plugin
+also ships a `SessionEnd` hook that appends one JSON line per finished session to
+`~/.claude/session-stats/sessions.jsonl`. Nothing leaves your machine.
+
+```bash
+python3 ~/.claude/skills/session-stats/session_stats.py --backfill   # seed from transcripts on disk
+python3 ~/.claude/skills/session-stats/session_stats.py --rollup     # aggregate everything
+```
+
+```
+-- TOTALS ------------------------------------------------------------------
+API requests                   24,322
+Input (uncached)            7,438,456
+Cache write               122,122,510
+Cache read              3,353,747,296
+Output                     14,923,474
+Cache hit rate                  96.3%
+Subagents spawned                 250
+
+  model                       reqs       input    cache wr    cache rd      output
+  claude-opus-4-8            10,025   2,873,633  51,474,722 1,346,359,109   7,531,178
+  claude-fable-5              8,466   1,847,046  44,025,830 1,347,947,408   5,943,224
+  claude-sonnet-5             5,057   2,706,004  22,456,270 580,211,821   1,093,208
+
+-- BY DAY / BY PROJECT / BIGGEST SESSIONS ...
+```
+
+`--days N` windows the report, `--json` emits it machine-readably (`--full`
+includes every session record for your own analysis).
+
+If you installed by hand rather than as a plugin, add the hook yourself — see
+`hooks/hooks.json` for the exact command, using
+`~/.claude/skills/session-stats/session_stats.py` as the path.
+
 ## Install
 
 ### As a plugin (recommended)
@@ -92,6 +128,10 @@ Everything comes from the JSONL transcripts Claude Code already writes under
 | subagents | `<project-slug>/<session-id>/subagents/agent-<id>.jsonl` (+ `.meta.json`) |
 | workflow runs | `<project-slug>/<session-id>/workflows/wf_*.json` |
 
+The history log is the one file this tool writes:
+`~/.claude/session-stats/sessions.jsonl` (`$CLAUDE_SESSION_STATS_LOG` overrides).
+Records are append-only and deduped by session id on read.
+
 The current session is identified via `$CLAUDE_CODE_SESSION_ID`, falling back to
 the newest transcript for the working directory.
 
@@ -116,3 +156,5 @@ stale. Multiply by current rates if you want a cost estimate.
   inspect the earlier one.
 - Compaction does not truncate the transcript, so totals stay cumulative for the
   whole session.
+- `SessionEnd` doesn't fire if the process is killed outright, so a session can
+  be missing from the log — `--backfill` recovers it while the transcript lives.

@@ -1,7 +1,7 @@
 ---
 name: session-stats
 description: Report token, cache, and subagent statistics for a Claude Code session — input/output tokens, cache write/read and hit rate, per-model breakdown, and the tree of spawned subagents (including nested ones) with each one's model and token usage.
-argument-hint: "[session-id] [--json]"
+argument-hint: "[session-id] [--json] [--rollup] [--backfill]"
 disable-model-invocation: true
 ---
 
@@ -12,6 +12,7 @@ report for the current (or a named) session.
 
 Invoked only by the user via `/session-stats`. An argument, if given, is a
 session id (pass it as `--session <id>`); `--json` switches to JSON output.
+`--rollup` and `--backfill` are passed straight through (see History below).
 
 ## Usage
 
@@ -39,6 +40,28 @@ Options:
 Then relay the report to the user. Print the table as-is (it is already
 formatted); add a sentence or two of interpretation only where it helps — e.g.
 which subagent dominated output tokens, or an unusually low cache hit rate.
+
+## History across sessions
+
+A `SessionEnd` hook appends one JSON line per finished session to
+`~/.claude/session-stats/sessions.jsonl` (override with
+`$CLAUDE_SESSION_STATS_LOG`). That log outlives the transcripts, which
+`cleanupPeriodDays` eventually deletes.
+
+```bash
+python3 <script> --rollup                # totals, per-model, by day, by project
+python3 <script> --rollup --days 7       # window it
+python3 <script> --rollup --json --full  # every record, machine-readable
+python3 <script> --backfill              # import sessions still on disk
+```
+
+`--rollup` reports one row per session, deduped by session id (a session can be
+logged more than once -- `/clear` fires `SessionEnd` while the id lives on, and
+a backfill may re-log it -- so the record with the most output tokens wins).
+
+`--backfill` sweeps every transcript under `~/.claude/projects/` and logs the
+ones missing from the log. Run it after installing the hook to seed history, and
+any time a session ended without the hook firing (crash, `kill -9`).
 
 ## What the numbers mean
 
@@ -75,6 +98,8 @@ stale. Multiply by current per-model rates if the user wants a cost estimate.
 
 - Stats reflect what has been flushed to the transcript, so the last in-flight
   request may be missing.
+- `SessionEnd` does not fire if the process is killed outright, so the log can
+  miss a session; `--backfill` recovers it while the transcript still exists.
 - Resuming or forking a session starts a new session id; stats cover one id.
   Pass `--session` to look at the earlier one.
 - Compaction does not erase history from the transcript, so totals are

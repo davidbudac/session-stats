@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{ command -v python3 >/dev/null 2>&1 && P=python3 || P=/usr/bin/python3; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/skills/session-stats/session_stats.py\" --log; } >/dev/null 2>&1 || true # session-stats",
+            "timeout": 30,
+            "statusMessage": "Logging session stats"
+          }
+        ]
+      }
+    ]
+  }
+}
