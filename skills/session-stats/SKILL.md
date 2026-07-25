@@ -63,6 +63,21 @@ a backfill may re-log it -- so the record with the most output tokens wins).
 ones missing from the log. Run it after installing the hook to seed history, and
 any time a session ended without the hook firing (crash, `kill -9`).
 
+## Visual dashboard
+
+`visualize.py` (same directory) turns the log into a standalone HTML page —
+hero total, KPI tiles, output per day, input composition per day, output by model
+and by project, a daily table and the biggest sessions, with 7/30/90/all range
+filters. No network, no dependencies, light and dark.
+
+```bash
+python3 <dir>/visualize.py --open          # write ~/.claude/session-stats/dashboard.html and open it
+python3 <dir>/visualize.py --out /tmp/usage.html
+```
+
+Prefer this when the user asks to *see*, chart, or graph their usage; use
+`--rollup` when they want numbers in the terminal.
+
 ## What the numbers mean
 
 - **Input (uncached)** — fresh input tokens billed at full rate.

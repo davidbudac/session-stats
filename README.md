@@ -75,6 +75,20 @@ Subagents spawned                 250
 `--days N` windows the report, `--json` emits it machine-readably (`--full`
 includes every session record for your own analysis).
 
+### Dashboard
+
+`visualize.py` renders the same log as a standalone HTML page — one file, no
+network, no dependencies, light and dark:
+
+```bash
+python3 ~/.claude/skills/session-stats/visualize.py --open
+```
+
+Hero total and KPI tiles, output tokens per day, input composition per day
+(cache read / cache write / uncached, stacked), output by model and by project,
+a daily table, and your biggest sessions — with 7/30/90/all range filters that
+scope every chart at once. Hover any column or bar for exact numbers.
+
 If you installed by hand rather than as a plugin, add the hook yourself — see
 `hooks/hooks.json` for the exact command, using
 `~/.claude/skills/session-stats/session_stats.py` as the path.
