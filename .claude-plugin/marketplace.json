@@ -1,0 +1,13 @@
+{
+  "name": "session-stats-marketplace",
+  "owner": {
+    "name": "David Budac"
+  },
+  "plugins": [
+    {
+      "name": "session-stats",
+      "source": "./",
+      "description": "Token, cache, and subagent statistics for the current Claude Code session."
+    }
+  ]
+}
