@@ -13,9 +13,14 @@ Modes:
                                          (SessionEnd hook entry point)
     session_stats.py --rollup            aggregate the history log
     session_stats.py --backfill          log every past session not yet logged
+    session_stats.py --backfill --force  re-log every session still on disk
 
 With no --session it uses $CLAUDE_CODE_SESSION_ID, falling back to the most
 recently modified transcript for the current working directory.
+
+Each API request is counted once per session (forks copy their parent's
+history) and once across the log (a resumed session copies the old one's
+history); log records carry the request keys they own for that.
 
 History log (JSONL, one record per session):
     ~/.claude/session-stats/sessions.jsonl   ($CLAUDE_SESSION_STATS_LOG overrides)
@@ -23,6 +28,7 @@ History log (JSONL, one record per session):
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -31,12 +37,19 @@ from datetime import datetime, timedelta, timezone
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 DEFAULT_LOG = os.path.expanduser("~/.claude/session-stats/sessions.jsonl")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 USAGE_FIELDS = ("input_tokens", "output_tokens",
                 "cache_creation_input_tokens", "cache_read_input_tokens")
 SUM_FIELDS = USAGE_FIELDS + ("requests", "ephemeral_1h", "ephemeral_5m",
                              "web_search", "web_fetch", "api_errors")
+
+# user rows that are output, notices or injected context, not something typed
+NOT_PROMPTS = ("<local-command-stdout>", "<local-command-stderr>",
+               "<local-command-caveat>", "<bash-stdout>", "<bash-stderr>",
+               "<task-notification>", "[Request interrupted",
+               "Another Claude session sent a message:")
+NOT_PROMPT_ORIGINS = ("task-notification", "peer")
 
 
 def log_path():
@@ -83,83 +96,114 @@ def blank():
     }
 
 
+def request_key(row, msg):
+    """Short id of one API request -- the form the log's request_keys hold."""
+    raw = "%s:%s" % (row.get("requestId"), msg.get("id"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def is_prompt(row, content):
+    """True for a user row the human sent (slash commands included)."""
+    origin = row.get("origin")
+    if (row.get("isMeta") or row.get("isCompactSummary") or
+            (isinstance(origin, dict) and origin.get("kind") in NOT_PROMPT_ORIGINS)):
+        return False
+    text = content
+    if isinstance(content, list):
+        blocks = [b for b in content if isinstance(b, dict)]
+        if any(b.get("type") == "tool_result" for b in blocks):
+            return False
+        text = next((b.get("text") for b in blocks if b.get("type") == "text"), "")
+    return not (text or "").lstrip().startswith(NOT_PROMPTS)
+
+
 def scan(path, skip_sidechain=False):
-    """Aggregate one transcript in a single streaming pass.
+    """Index one transcript in a single streaming pass; nothing is summed yet.
 
-    Returns (stats, tool_use_ids, meta). Usage is repeated on every content
-    block of a message, so requests are deduped on (requestId, message.id) --
-    without that, totals come out 2-4x too high.
+    Returns {"requests": {key: {model, usage, tools, row}}, "prompts": [row],
+    "errors": [row], "stamps": [(row, ts)], "tool_ids": set, "info": {}}, rows
+    numbered in file order. One API message is written as one row per content
+    block, all sharing (requestId, message.id) and the usage object -- except
+    output_tokens, which grows across them, so the last row's usage is final.
     """
-    s = blank()
-    tool_ids = set()
-    meta = {}
-    seen = set()
+    t = {"requests": {}, "prompts": [], "errors": [], "stamps": [],
+         "tool_ids": set(), "info": {}}
+    info, reqs = t["info"], t["requests"]
 
-    for row in iter_rows(path):
+    for i, row in enumerate(iter_rows(path)):
         if skip_sidechain and row.get("isSidechain"):
             continue
-        if "cwd" in row and "cwd" not in meta:
-            meta["cwd"] = row["cwd"]
+        if "cwd" in row and "cwd" not in info:
+            info["cwd"] = row["cwd"]
         if "version" in row:
-            meta["version"] = row["version"]
-        if "sessionId" in row and "sessionId" not in meta:
-            meta["sessionId"] = row["sessionId"]
+            info["version"] = row["version"]
         if "gitBranch" in row and row.get("gitBranch"):
-            meta["gitBranch"] = row["gitBranch"]
-
-        ts = row.get("timestamp")
-        if ts:
-            if s["first_ts"] is None or ts < s["first_ts"]:
-                s["first_ts"] = ts
-            if s["last_ts"] is None or ts > s["last_ts"]:
-                s["last_ts"] = ts
+            info["gitBranch"] = row["gitBranch"]
+        if row.get("timestamp"):
+            t["stamps"].append((i, row["timestamp"]))
 
         msg = row.get("message") or {}
         content = msg.get("content")
-
         if row.get("type") == "user" and isinstance(content, (str, list)):
-            # only count real prompts, not tool_result carrier messages
-            if isinstance(content, str):
-                s["user_turns"] += 1
-            elif not any(isinstance(b, dict) and b.get("type") == "tool_result"
-                         for b in content):
-                s["user_turns"] += 1
-
-        if isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "tool_use":
-                    s["tools"][b.get("name", "?")] += 1
-                    tool_ids.add(b.get("id"))
-
+            if is_prompt(row, content):
+                t["prompts"].append(i)
+            continue
         if row.get("type") != "assistant":
             continue
 
-        model = msg.get("model") or "unknown"
         if row.get("isApiErrorMessage"):
-            s["api_errors"] += 1
+            t["errors"].append(i)
+        model = msg.get("model") or "unknown"
         if model == "<synthetic>":
             continue
 
-        key = (row.get("requestId"), msg.get("id"))
-        if key in seen:
-            continue
-        seen.add(key)
+        key = request_key(row, msg)
+        req = reqs.get(key)
+        if req is None:
+            req = reqs[key] = {"model": model, "usage": {}, "tools": {}}
+        req["row"] = i
+        if msg.get("usage"):
+            req["usage"] = msg["usage"]
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    req["tools"][b.get("id") or len(req["tools"])] = b.get("name", "?")
+                    t["tool_ids"].add(b.get("id"))
+    return t
 
-        usage = msg.get("usage") or {}
+
+def tally(t):
+    """Stats for a scanned transcript over the requests it owns (t["owned"]).
+
+    Copied history (fork, resume) is always a prefix of the file and keeps its
+    original timestamps, so prompts, API errors and the time window only count
+    rows after the last request owned elsewhere.
+    """
+    s = blank()
+    reqs, owned = t["requests"], t["owned"]
+    cut = max([r["row"] for k, r in reqs.items() if k not in owned] or [-1])
+    for k in owned:
+        r = reqs[k]
+        usage, m = r["usage"], s["by_model"][r["model"]]
         s["requests"] += 1
-        s["by_model"][model]["requests"] += 1
+        m["requests"] += 1
         for f in USAGE_FIELDS:
             v = usage.get(f) or 0
             s[f] += v
-            s["by_model"][model][f] += v
+            m[f] += v
         cc = usage.get("cache_creation") or {}
         s["ephemeral_1h"] += cc.get("ephemeral_1h_input_tokens") or 0
         s["ephemeral_5m"] += cc.get("ephemeral_5m_input_tokens") or 0
         stu = usage.get("server_tool_use") or {}
         s["web_search"] += stu.get("web_search_requests") or 0
         s["web_fetch"] += stu.get("web_fetch_requests") or 0
-
-    return s, tool_ids, meta
+        s["tools"].update(r["tools"].values())
+    s["user_turns"] = sum(1 for i in t["prompts"] if i > cut)
+    s["api_errors"] = sum(1 for i in t["errors"] if i > cut)
+    stamps = [ts for i, ts in t["stamps"] if i > cut]
+    if stamps:
+        s["first_ts"], s["last_ts"] = min(stamps), max(stamps)
+    return s
 
 
 def add_into(total, s):
@@ -229,27 +273,63 @@ def collect_agents(project_dir, session_id):
         agents.append({"id": agent_id, "path": path, "meta": {}})
 
     for a in agents:
-        a["stats"], a["tool_ids"], _ = scan(a["path"])
+        a["scan"] = scan(a["path"])
     return agents
+
+
+def spawn_rank(a):
+    depth = a["meta"].get("spawnDepth")
+    return (depth if isinstance(depth, int) else 1 << 30,
+            bool(a["meta"].get("isFork")), a["id"])
 
 
 def link_parents(agents, main_tool_ids):
-    """Attach parent_id from meta.parentAgentId, else by finding which
-    transcript issued the spawning tool_use id."""
-    owner = {tid: "" for tid in main_tool_ids}
-    for a in agents:
-        for tid in a["tool_ids"]:
-            owner[tid] = a["id"]
+    """Attach parent_id ("" = main thread) from meta.parentAgentId, else from
+    the transcript that issued the spawning toolUseId.
 
+    A fork's transcript starts with a copy of its parent's history, spawning
+    tool_use included, so several transcripts can hold that id: prefer the
+    main thread, then the shallowest spawnDepth, never the agent itself.
+    Anything unresolved goes to the top level, and cycles are cut, so every
+    agent is reachable from the main thread.
+    """
     known = {a["id"] for a in agents}
+    holders = defaultdict(list)
+    for a in agents:
+        for tid in a["scan"]["tool_ids"]:
+            holders[tid].append(a)
+
     for a in agents:
         parent = a["meta"].get("parentAgentId")
-        if parent not in known:
-            parent = owner.get(a["meta"].get("toolUseId"), "")
-            if parent not in known:
+        if parent not in known or parent == a["id"]:
+            tid = a["meta"].get("toolUseId")
+            others = [h for h in holders.get(tid, ()) if h is not a]
+            if not tid or tid in main_tool_ids or not others:
                 parent = ""
+            else:
+                parent = min(others, key=spawn_rank)["id"]
         a["parent_id"] = parent
+
+    by_id = {a["id"]: a for a in agents}
+    for a in agents:
+        p, hops = a["parent_id"], 0
+        while p and p != a["id"] and hops < len(agents):
+            p, hops = by_id[p]["parent_id"], hops + 1
+        if p == a["id"]:
+            a["parent_id"] = ""
     return agents
+
+
+def tree_order(agents):
+    """Agents breadth first from the main thread: parents before children."""
+    kids = defaultdict(list)
+    for a in agents:
+        kids[a["parent_id"]].append(a)
+    out, level = [], kids.pop("", [])
+    while level:
+        out += level
+        level = [c for a in level for c in kids.pop(a["id"], [])]
+    return out + [a for rest in kids.values() for a in rest]  # unreachable; never expected
 
 
 def read_workflows(project_dir, session_id):
@@ -272,27 +352,45 @@ def read_workflows(project_dir, session_id):
     return out
 
 
-def build_report(path, session_id, fallback_cwd):
+def build_report(path, session_id, fallback_cwd, owners=None):
+    """owners maps request key -> the session id that logged it (see
+    log_owners). Requests logged by another session were copied in by a
+    resume or fork and are left out as inherited."""
     project_dir = os.path.dirname(path)
-    main_stats, main_tool_ids, meta = scan(path, skip_sidechain=True)
-    agents = link_parents(collect_agents(project_dir, session_id), main_tool_ids)
+    main = scan(path, skip_sidechain=True)
+    agents = link_parents(collect_agents(project_dir, session_id), main["tool_ids"])
 
+    # each request belongs to the transcript closest to the root that has it
+    owners = owners or {}
+    ordered = [main] + [a["scan"] for a in tree_order(agents)]
+    inherited = {k for t in ordered for k in t["requests"]
+                 if owners.get(k, session_id) != session_id}
+    taken = set(inherited)
+    for t in ordered:
+        t["owned"] = set(t["requests"]) - taken
+        taken |= t["owned"]
+
+    main_stats = tally(main)
     agent_total = blank()
     for a in agents:
+        a["stats"] = tally(a["scan"])
         add_into(agent_total, a["stats"])
     grand = add_into(add_into(blank(), main_stats), agent_total)
 
+    info = main["info"]
     return {
         "session_id": session_id,
         "transcript": path,
-        "cwd": meta.get("cwd") or fallback_cwd,
-        "version": meta.get("version"),
-        "git_branch": meta.get("gitBranch"),
+        "cwd": info.get("cwd") or fallback_cwd,
+        "version": info.get("version"),
+        "git_branch": info.get("gitBranch"),
         "main": main_stats,
         "agents": agents,
         "agent_total": agent_total,
         "grand_total": grand,
         "workflows": read_workflows(project_dir, session_id),
+        "inherited_requests": len(inherited),
+        "request_keys": sorted(taken - inherited),
     }
 
 
@@ -390,6 +488,9 @@ def render(report):
         local(report["main"]["last_ts"]),
         dur(report["main"]["first_ts"], report["main"]["last_ts"])))
     L.append("%-22s %s" % ("User prompts", n(report["main"]["user_turns"])))
+    if report["inherited_requests"]:
+        L.append("%-22s %s  (already logged under another session)" % (
+            "Inherited requests", n(report["inherited_requests"])))
     L.append("")
     L.append("-- MAIN THREAD " + "-" * (W - 15))
     L += token_block(report["main"])
@@ -411,33 +512,37 @@ def render(report):
         by_parent = defaultdict(list)
         for a in agents:
             by_parent[a["parent_id"]].append(a)
+        shown = set()
 
-        def walk(parent, depth):
-            for a in by_parent.get(parent, []):
-                s = a["stats"]
-                pad = "  " + "    " * depth
-                label, desc = agent_label(a)
-                models = ", ".join(sorted(s["by_model"])) or "-"
-                L.append("%s%s %s  [%s]" % (
-                    pad, "|-" if depth else "*", label, models))
-                if desc:
-                    L.append("%s   %s" % (pad, desc[:60]))
-                L.append("%s   id=%s  reqs=%s  in=%s  cw=%s  cr=%s  out=%s  %s"
-                         % (pad, a["id"][:9], n(s["requests"]),
-                            n(s["input_tokens"]),
-                            n(s["cache_creation_input_tokens"]),
-                            n(s["cache_read_input_tokens"]),
-                            n(s["output_tokens"]),
-                            dur(s["first_ts"], s["last_ts"])))
-                if s["tools"]:
-                    L.append("%s   tools: %s" % (pad, ", ".join(
-                        "%s=%d" % (k, v) for k, v in s["tools"].most_common(6))))
-                walk(a["id"], depth + 1)
+        def show(a, depth):
+            if a["id"] in shown:
+                return
+            shown.add(a["id"])
+            s = a["stats"]
+            pad = "  " + "    " * depth
+            label, desc = agent_label(a)
+            models = ", ".join(sorted(s["by_model"])) or "-"
+            L.append("%s%s %s  [%s]" % (
+                pad, "|-" if depth else "*", label, models))
+            if desc:
+                L.append("%s   %s" % (pad, desc[:60]))
+            L.append("%s   id=%s  reqs=%s  in=%s  cw=%s  cr=%s  out=%s  %s"
+                     % (pad, a["id"][:9], n(s["requests"]),
+                        n(s["input_tokens"]),
+                        n(s["cache_creation_input_tokens"]),
+                        n(s["cache_read_input_tokens"]),
+                        n(s["output_tokens"]),
+                        dur(s["first_ts"], s["last_ts"])))
+            if s["tools"]:
+                L.append("%s   tools: %s" % (pad, ", ".join(
+                    "%s=%d" % (k, v) for k, v in s["tools"].most_common(6))))
+            for c in by_parent.get(a["id"], []):
+                show(c, depth + 1)
 
-        walk("", 0)
-        orphans = set(by_parent) - {a["id"] for a in agents} - {""}
-        for p in sorted(orphans):
-            walk(p, 0)
+        for a in by_parent.get("", []):
+            show(a, 0)
+        for a in agents:  # link_parents leaves none behind; never hide one anyway
+            show(a, 0)
 
         L.append("")
         L.append("  subagent totals:")
@@ -495,6 +600,7 @@ def report_json(report):
         "agent_total": jsonable(report["agent_total"]),
         "grand_total": jsonable(report["grand_total"]),
         "workflows": report["workflows"],
+        "inherited_requests": report["inherited_requests"],
     }
 
 
@@ -533,6 +639,8 @@ def log_record(report, reason=None):
             "cache_creation_input_tokens": a["stats"]["cache_creation_input_tokens"],
             "cache_read_input_tokens": a["stats"]["cache_read_input_tokens"],
         } for a in report["agents"]],
+        "inherited_requests": report["inherited_requests"],
+        "request_keys": report["request_keys"],
     }
 
 
@@ -548,11 +656,17 @@ def append_record(record, path=None):
     return path
 
 
+def record_rank(rec):
+    return (rec.get("schema") or 0,
+            (rec.get("grand_total") or {}).get("output_tokens") or 0)
+
+
 def read_log(path=None):
-    """Records from the log, deduped per session id (largest total wins).
+    """Records from the log, deduped per session id.
 
     A session can be logged more than once -- /clear fires SessionEnd while the
-    id lives on, and a backfill may re-log a session -- so keep the record with
+    id lives on, and a backfill may re-log a session. The newest schema wins
+    (older ones over-count forks and undercount output), then the record with
     the most output tokens, which is the most complete one.
     """
     path = path or log_path()
@@ -562,14 +676,23 @@ def read_log(path=None):
         if not sid:
             continue
         prev = best.get(sid)
-        if prev is None or (rec.get("grand_total", {}).get("output_tokens", 0) >
-                            prev.get("grand_total", {}).get("output_tokens", 0)):
+        if prev is None or record_rank(rec) > record_rank(prev):
             best[sid] = rec
     return sorted(best.values(), key=lambda r: r.get("ended_at") or "")
 
 
-def logged_session_ids(path=None):
-    return {rec.get("session_id") for rec in iter_rows(path or log_path())}
+def log_owners(path=None):
+    """One pass over the log: (request key -> first session id that logged
+    it, set of every session id logged)."""
+    owners, logged = {}, set()
+    for rec in iter_rows(path or log_path()):
+        sid = rec.get("session_id")
+        if not sid:
+            continue
+        logged.add(sid)
+        for k in rec.get("request_keys") or ():
+            owners.setdefault(k, sid)
+    return owners, logged
 
 
 def hook_payload():
@@ -601,7 +724,8 @@ def do_log(args):
     else:
         path, session_id = find_session(session_id, cwd)
 
-    report = build_report(path, session_id, cwd)
+    owners, _ = log_owners(args.log_file)
+    report = build_report(path, session_id, cwd, owners)
     if not report["grand_total"]["requests"]:
         return 0  # nothing happened; don't clutter the log
 
@@ -614,30 +738,44 @@ def do_log(args):
     return 0
 
 
+def started(path):
+    """Sort key putting a session before any session resumed from it.
+
+    A resume's copied history keeps its original timestamps but follows the
+    resume's own first rows, so the first timestamped row in file order is
+    when the session began. File creation time breaks ties.
+    """
+    ts = next((r["timestamp"] for r in iter_rows(path) if r.get("timestamp")), "")
+    st = os.stat(path)
+    return ts, getattr(st, "st_birthtime", st.st_mtime)
+
+
 def do_backfill(args):
-    known = logged_session_ids(args.log_file)
-    candidates = []
+    owners, logged = log_owners(args.log_file)
+    todo = []
     for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
         name = os.path.basename(path)
-        if name.startswith("agent-"):
-            continue
         sid = name[:-len(".jsonl")]
-        if sid in known:
+        if name.startswith("agent-") or (sid in logged and not args.force):
             continue
-        candidates.append((path, sid))
+        todo.append((started(path), path, sid))
 
     added = skipped = 0
-    for path, sid in sorted(candidates, key=lambda c: os.path.getmtime(c[0])):
+    for _, path, sid in sorted(todo):
         try:
-            report = build_report(path, sid, os.path.dirname(path))
+            report = build_report(path, sid, os.path.dirname(path), owners)
         except Exception as exc:  # a corrupt transcript must not abort the sweep
             print("session-stats: skipped %s (%s)" % (sid, exc), file=sys.stderr)
             skipped += 1
             continue
-        if not report["grand_total"]["requests"]:
+        # an empty record still has to supersede an older, double-counted one
+        if not report["grand_total"]["requests"] and sid not in logged:
             skipped += 1
             continue
-        append_record(log_record(report, reason="backfill"), args.log_file)
+        rec = log_record(report, reason="backfill")
+        append_record(rec, args.log_file)
+        for k in rec["request_keys"]:
+            owners.setdefault(k, sid)
         added += 1
     print("session-stats: backfilled %d session(s), skipped %d, log: %s"
           % (added, skipped, args.log_file or log_path()))
@@ -783,6 +921,8 @@ def main():
                     help="aggregate the history log across sessions")
     ap.add_argument("--backfill", action="store_true",
                     help="log every past session not already in the log")
+    ap.add_argument("--force", action="store_true",
+                    help="--backfill: re-log every session on disk, logged or not")
     ap.add_argument("--log-file", help="history log path (default %s)" % DEFAULT_LOG)
     ap.add_argument("--days", type=int, default=0,
                     help="--rollup: only sessions from the last N days (0 = all)")
@@ -809,7 +949,8 @@ def main():
 
     cwd = args.project_dir or os.getcwd()
     path, session_id = find_session(args.session, cwd)
-    report = build_report(path, session_id, cwd)
+    owners, _ = log_owners(args.log_file)
+    report = build_report(path, session_id, cwd, owners)
     print(json.dumps(report_json(report), indent=2) if args.json else render(report))
     return 0
 
