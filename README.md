@@ -54,6 +54,11 @@ python3 ~/.claude/skills/session-stats/session_stats.py --backfill   # seed from
 python3 ~/.claude/skills/session-stats/session_stats.py --rollup     # aggregate everything
 ```
 
+Upgrading from a log written by an older version (records without
+`"schema": 2`)? Run `--backfill --force` once: it re-logs every session whose
+transcript is still on disk, oldest first, and the new records supersede the
+old ones on read. Nothing already in the log is rewritten.
+
 ```
 -- TOTALS ------------------------------------------------------------------
 API requests                   24,322
@@ -87,7 +92,8 @@ python3 ~/.claude/skills/session-stats/visualize.py --open
 Hero total and KPI tiles, output tokens per day, input composition per day
 (cache read / cache write / uncached, stacked), output by model and by project,
 a daily table, and your biggest sessions — with 7/30/90/all range filters that
-scope every chart at once. Hover any column or bar for exact numbers.
+scope every chart at once. Hover any column or bar for exact numbers. It reads
+the log from `--log-file`, else `$CLAUDE_SESSION_STATS_LOG`, else the default.
 
 If you installed by hand rather than as a plugin, add the hook yourself — see
 `hooks/hooks.json` for the exact command, using
@@ -142,23 +148,37 @@ Everything comes from the JSONL transcripts Claude Code already writes under
 | subagents | `<project-slug>/<session-id>/subagents/agent-<id>.jsonl` (+ `.meta.json`) |
 | workflow runs | `<project-slug>/<session-id>/workflows/wf_*.json` |
 
-The history log is the one file this tool writes:
-`~/.claude/session-stats/sessions.jsonl` (`$CLAUDE_SESSION_STATS_LOG` overrides).
-Records are append-only and deduped by session id on read.
+The history log (plus `dashboard.html` next to it, if you run `visualize.py`) is
+all this tool writes: `~/.claude/session-stats/sessions.jsonl`
+(`$CLAUDE_SESSION_STATS_LOG` overrides). Records are append-only and deduped by
+session id on read: the newest `schema` wins, then the most output tokens.
 
 The current session is identified via `$CLAUDE_CODE_SESSION_ID`, falling back to
 the newest transcript for the working directory.
 
-Two details worth knowing, because naive transcript parsers get them wrong:
+Details worth knowing, because naive transcript parsers get them wrong:
 
 - **Usage is repeated per content block.** One API response with thinking, text
-  and two tool calls writes four transcript lines carrying the *same* usage
-  object. Requests are deduped on `(requestId, message.id)`, otherwise totals
-  come out 2-4x too high.
+  and two tool calls writes four transcript lines sharing `(requestId,
+  message.id)` and the usage object. Requests are deduped on that key,
+  otherwise totals come out 2-4x too high. But `output_tokens` grows from line
+  to line, so the *last* line's usage is the real one -- the first undercounts
+  output by about a third.
+- **Forks copy their parent's history.** A fork subagent's transcript starts
+  with a copy of the parent's rows (same request ids, rewritten session and
+  agent ids). Each request is counted once per session, for the transcript
+  closest to the root that has it; tool calls and prompts in the copy are
+  left out with it.
+- **So do resumed sessions.** Resuming or forking a session into a new session
+  id copies the old history into the new transcript. Each log record stores
+  the requests it owns as `request_keys` (short sha1 hashes of
+  `requestId:messageId`), and requests owned by another session in the log are
+  excluded when a session is logged or reported on.
 - **Subagent nesting is not in one field.** Depth comes from
   `parentAgentId` when present; otherwise the parent is found by looking up
-  which transcript issued the spawning `toolUseId`. So a sub-subagent lands in
-  the right place in the tree.
+  which transcript issued the spawning `toolUseId`. Forks hold a copy of that
+  call too, so the main thread wins, then the shallowest `spawnDepth`. So a
+  sub-subagent lands in the right place in the tree.
 
 Tokens are reported, not dollars — no price table is baked in, so nothing goes
 stale. Multiply by current rates if you want a cost estimate.
@@ -167,8 +187,23 @@ stale. Multiply by current rates if you want a cost estimate.
 
 - Stats reflect what has been flushed to disk; an in-flight request may be missing.
 - Resuming or forking a session creates a new session id; use `--session` to
-  inspect the earlier one.
+  inspect the earlier one. Its copied history is only recognised once the
+  earlier session is in the log, and copied prompts are skipped by position, so
+  a trailing prompt that never got a reply can still be counted twice.
+- Log records from before schema 2 whose transcripts are already deleted stay
+  at schema 1: they undercount output and may double-count forks and resumes.
 - Compaction does not truncate the transcript, so totals stay cumulative for the
   whole session.
 - `SessionEnd` doesn't fire if the process is killed outright, so a session can
   be missing from the log — `--backfill` recovers it while the transcript lives.
+
+## Tests
+
+Standard library only; from the repo root:
+
+```bash
+python3 -m unittest discover tests
+```
+
+The tests build small synthetic transcripts and logs in temp dirs; they never
+touch `~/.claude`.

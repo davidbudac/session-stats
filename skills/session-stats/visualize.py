@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Render the session-stats history log as a standalone HTML dashboard.
 
-Reads ~/.claude/session-stats/sessions.jsonl (the log written by
-session_stats.py --log / --backfill) and writes a single self-contained HTML
-file: no network, no dependencies, works offline, light and dark.
+Reads the log written by session_stats.py --log / --backfill
+(~/.claude/session-stats/sessions.jsonl, $CLAUDE_SESSION_STATS_LOG overrides)
+and writes a single self-contained HTML file: no network, no dependencies,
+works offline, light and dark.
 
 Usage:
     visualize.py                       write ~/.claude/session-stats/dashboard.html
@@ -17,38 +18,13 @@ import json
 import os
 import sys
 import webbrowser
-from collections import defaultdict
 from datetime import datetime
 
-DEFAULT_LOG = os.path.expanduser("~/.claude/session-stats/sessions.jsonl")
+# one dedupe rule for the log, shared with session_stats.py next door
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from session_stats import log_path, read_log  # noqa: E402
+
 DEFAULT_OUT = os.path.expanduser("~/.claude/session-stats/dashboard.html")
-
-
-def read_log(path):
-    """Records deduped per session id, largest output wins (see session_stats.py)."""
-    best = {}
-    try:
-        fh = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError as exc:
-        sys.exit("Cannot read %s (%s).\nRun session_stats.py --backfill first."
-                 % (path, exc))
-    with fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            sid = rec.get("session_id")
-            if not sid:
-                continue
-            prev = best.get(sid)
-            if prev is None or (rec.get("grand_total", {}).get("output_tokens", 0) >
-                                prev.get("grand_total", {}).get("output_tokens", 0)):
-                best[sid] = rec
-    return sorted(best.values(), key=lambda r: r.get("ended_at") or "")
 
 
 def compact(records):
@@ -607,22 +583,22 @@ addEventListener("scroll", () => {
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--log-file", default=DEFAULT_LOG, help="history log (default %s)" % DEFAULT_LOG)
+    ap.add_argument("--log-file", help="history log (default %s)" % log_path())
     ap.add_argument("--out", default=DEFAULT_OUT, help="output HTML (default %s)" % DEFAULT_OUT)
     ap.add_argument("--open", action="store_true", help="open the file in a browser")
     args = ap.parse_args()
 
-    records = read_log(args.log_file)
-    rows = compact(records)
+    log = args.log_file or log_path()
+    rows = compact(read_log(log))
     if not rows:
-        sys.exit("No usable records in %s. Run session_stats.py --backfill first." % args.log_file)
+        sys.exit("No usable records in %s. Run session_stats.py --backfill first." % log)
 
     span = "%s – %s" % (rows[0]["d"], rows[-1]["d"]) if rows else ""
     meta = {
         "sessions": len(rows),
         "span": span,
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "log": args.log_file,
+        "log": log,
     }
     html = (HTML.replace("__DATA__", json.dumps(rows, separators=(",", ":")))
                 .replace("__META__", json.dumps(meta)))
